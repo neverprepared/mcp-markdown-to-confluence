@@ -13,8 +13,8 @@
     "dev": "node --watch dist/index.js"
   },
   "dependencies": {
-    "@markdown-confluence/lib": "^5.5.3",
-    "@markdown-confluence/mermaid-puppeteer-renderer": "^5.5.3",
+    "@markdown-confluence/lib": "^5.5.2",
+    "@markdown-confluence/mermaid-puppeteer-renderer": "^5.5.2",
     "@modelcontextprotocol/sdk": "^1.10.1",
     "confluence.js": "^1.6.3",
     "gray-matter": "^4.0.3",

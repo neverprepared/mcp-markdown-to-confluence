@@ -103,8 +103,7 @@ async function publishMarkdown(
   // Parse markdown → ADF
   const adf = parseMarkdownToADF(
     markdown,
-    CONFLUENCE_BASE_URL,
-    title
+    CONFLUENCE_BASE_URL
   ) as unknown as any;
 
   const mermaidCount = countMermaidBlocks(adf);
@@ -310,8 +309,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const adf = parseMarkdownToADF(
         input.markdown,
-        CONFLUENCE_BASE_URL,
-        'preview'
+        CONFLUENCE_BASE_URL
       ) as unknown as any;
 
       const mermaidCount = countMermaidBlocks(adf);
