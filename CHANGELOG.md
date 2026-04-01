@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.0.1...v1.1.0) (2026-04-01)
+
+
+### Features
+
+* replace Puppeteer with Kroki for diagram rendering ([de5f897](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/de5f8976f24bf77df44c99398f574d8054c60a78))
+
+
+### Bug Fixes
+
+* full lockfile regeneration from clean node_modules ([c8122e6](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/c8122e60deab57f9e2bf399999b3542873e53c30))
+* regenerate package-lock.json for clean npm ci ([2f7ec3e](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/2f7ec3ec233c101c47f08167abdd96a01d2f4370))
+
 ## [1.0.1](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.0.0...v1.0.1) (2026-04-01)
 
 
