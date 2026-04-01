@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.0...v1.1.1) (2026-04-01)
+
+
+### Bug Fixes
+
+* use SVG format for diagram types that don't support PNG ([87e9b3d](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/87e9b3db208c681f15078d591a25adecb19f6178))
+
 ## [1.1.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.0.1...v1.1.0) (2026-04-01)
 
 
