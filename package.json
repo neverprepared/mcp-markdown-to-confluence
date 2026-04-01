@@ -1,6 +1,6 @@
 {
   "name": "@neverprepared/mcp-markdown-to-confluence",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "MCP server for converting markdown to Confluence ADF and publishing pages with diagram support via Kroki",
   "type": "module",
   "main": "dist/index.js",
