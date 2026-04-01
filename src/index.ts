@@ -14,9 +14,9 @@ import {
   renderADFDoc,
   executeADFProcessingPipeline,
   createPublisherFunctions,
+  MermaidRendererPlugin,
 } from '@markdown-confluence/lib';
-import { MermaidRendererPlugin } from '@markdown-confluence/lib';
-import { PuppeteerMermaidRenderer } from '@markdown-confluence/mermaid-puppeteer-renderer';
+import { KrokiClient, KrokiMermaidRenderer, KrokiDiagramPlugin } from './kroki/index.js';
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -25,6 +25,19 @@ import { PuppeteerMermaidRenderer } from '@markdown-confluence/mermaid-puppeteer
 const CONFLUENCE_BASE_URL = process.env.CONFLUENCE_BASE_URL ?? '';
 const CONFLUENCE_USERNAME = process.env.CONFLUENCE_USERNAME ?? '';
 const CONFLUENCE_API_TOKEN = process.env.CONFLUENCE_API_TOKEN ?? '';
+const KROKI_URL = process.env.KROKI_URL ?? 'http://localhost:8371';
+
+// ---------------------------------------------------------------------------
+// Kroki client
+// ---------------------------------------------------------------------------
+
+const krokiClient = new KrokiClient(KROKI_URL);
+
+const SUPPORTED_DIAGRAM_TYPES = [
+  'mermaid', 'plantuml', 'graphviz', 'dot', 'd2', 'ditaa', 'nomnoml',
+  'svgbob', 'pikchr', 'bytefield', 'wavedrom', 'vega', 'vega-lite',
+  'excalidraw', 'bpmn', 'erd', 'dbml', 'c4plantuml',
+];
 
 // ---------------------------------------------------------------------------
 // Confluence client
@@ -60,7 +73,7 @@ const stubAdaptor = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function countMermaidBlocks(adf: unknown): number {
+function countDiagramBlocks(adf: unknown): number {
   if (typeof adf !== 'object' || adf === null) return 0;
 
   const node = adf as Record<string, unknown>;
@@ -70,7 +83,9 @@ function countMermaidBlocks(adf: unknown): number {
     node['type'] === 'codeBlock' &&
     typeof node['attrs'] === 'object' &&
     node['attrs'] !== null &&
-    (node['attrs'] as Record<string, unknown>)['language'] === 'mermaid'
+    SUPPORTED_DIAGRAM_TYPES.includes(
+      (node['attrs'] as Record<string, unknown>)['language'] as string
+    )
   ) {
     count += 1;
   }
@@ -78,10 +93,10 @@ function countMermaidBlocks(adf: unknown): number {
   for (const value of Object.values(node)) {
     if (Array.isArray(value)) {
       for (const item of value) {
-        count += countMermaidBlocks(item);
+        count += countDiagramBlocks(item);
       }
     } else if (typeof value === 'object' && value !== null) {
-      count += countMermaidBlocks(value);
+      count += countDiagramBlocks(value);
     }
   }
 
@@ -99,18 +114,18 @@ async function publishMarkdown(
   pageId?: string,
   parentId?: string,
   skipPreview = false
-): Promise<{ isPreview: boolean; previewText?: string; mermaidCount?: number; pageId?: string; version?: number; url?: string }> {
+): Promise<{ isPreview: boolean; previewText?: string; diagramCount?: number; pageId?: string; version?: number; url?: string }> {
   // Parse markdown → ADF
   const adf = parseMarkdownToADF(
     markdown,
     CONFLUENCE_BASE_URL
   ) as unknown as any;
 
-  const mermaidCount = countMermaidBlocks(adf);
+  const diagramCount = countDiagramBlocks(adf);
 
   if (!skipPreview) {
     const previewText = renderADFDoc(adf as unknown as any);
-    return { isPreview: true, previewText, mermaidCount };
+    return { isPreview: true, previewText, diagramCount };
   }
 
   // ----- Full publish -----
@@ -187,9 +202,14 @@ async function publishMarkdown(
     currentAttachments
   );
 
-  // Run ADF processing pipeline (renders mermaid diagrams)
+  // Run ADF processing pipeline (renders diagrams via Kroki)
   const finalAdf = await executeADFProcessingPipeline(
-    [new MermaidRendererPlugin(new PuppeteerMermaidRenderer())],
+    [
+      new MermaidRendererPlugin(new KrokiMermaidRenderer(krokiClient)),
+      ...SUPPORTED_DIAGRAM_TYPES
+        .filter((t) => t !== 'mermaid')
+        .map((t) => new KrokiDiagramPlugin(t, krokiClient)),
+    ],
     adf as unknown as any,
     publisherFunctions
   );
@@ -220,7 +240,7 @@ async function publishMarkdown(
     isPreview: false,
     pageId: resolvedPageId,
     version: currentVersion + 1,
-    mermaidCount,
+    diagramCount,
     url,
   };
 }
@@ -312,13 +332,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         CONFLUENCE_BASE_URL
       ) as unknown as any;
 
-      const mermaidCount = countMermaidBlocks(adf);
+      const diagramCount = countDiagramBlocks(adf);
       const previewText = renderADFDoc(adf as unknown as any);
 
       const lines: string[] = [previewText];
-      if (mermaidCount > 0) {
+      if (diagramCount > 0) {
         lines.push(
-          `\n[Note: ${mermaidCount} mermaid diagram(s) detected — they will be rendered as images when published.]`
+          `\n[Note: ${diagramCount} diagram(s) detected — they will be rendered as images when published.]`
         );
       }
 
@@ -348,9 +368,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       if (result.isPreview) {
         const lines: string[] = ['=== PREVIEW ===\n', result.previewText ?? ''];
-        if ((result.mermaidCount ?? 0) > 0) {
+        if ((result.diagramCount ?? 0) > 0) {
           lines.push(
-            `\n[Note: ${result.mermaidCount} mermaid diagram(s) detected — they will be rendered when published.]`
+            `\n[Note: ${result.diagramCount} diagram(s) detected — they will be rendered when published.]`
           );
         }
         lines.push(
@@ -368,7 +388,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Title: ${input.title}`,
               `Page ID: ${result.pageId}`,
               `Version: ${result.version}`,
-              `Mermaid diagrams rendered: ${result.mermaidCount}`,
+              `Diagrams rendered: ${result.diagramCount}`,
               `URL: ${result.url}`,
             ].join('\n'),
           },
@@ -433,9 +453,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           '=== PREVIEW ===\n',
           result.previewText ?? '',
         ];
-        if ((result.mermaidCount ?? 0) > 0) {
+        if ((result.diagramCount ?? 0) > 0) {
           lines.push(
-            `\n[Note: ${result.mermaidCount} mermaid diagram(s) detected — they will be rendered when published.]`
+            `\n[Note: ${result.diagramCount} diagram(s) detected — they will be rendered when published.]`
           );
         }
         lines.push(
@@ -453,7 +473,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `File: ${input.filePath}`,
               `Page ID: ${result.pageId}`,
               `Version: ${result.version}`,
-              `Mermaid diagrams rendered: ${result.mermaidCount}`,
+              `Diagrams rendered: ${result.diagramCount}`,
               `URL: ${result.url}`,
             ].join('\n'),
           },

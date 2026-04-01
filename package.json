@@ -1,20 +1,25 @@
 {
   "name": "@neverprepared/mcp-markdown-to-confluence",
   "version": "1.0.1",
-  "description": "MCP server for converting markdown to Confluence ADF and publishing pages with mermaid diagram support",
+  "description": "MCP server for converting markdown to Confluence ADF and publishing pages with diagram support via Kroki",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "mcp-markdown-to-confluence": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "docker",
+    "scripts"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "node --watch dist/index.js"
+    "dev": "node --watch dist/index.js",
+    "postinstall": "sh scripts/postinstall.sh"
   },
   "dependencies": {
     "@markdown-confluence/lib": "^5.5.2",
-    "@markdown-confluence/mermaid-puppeteer-renderer": "^5.5.2",
     "@modelcontextprotocol/sdk": "^1.10.1",
     "confluence.js": "^1.6.3",
     "gray-matter": "^4.0.3",
@@ -41,6 +46,8 @@
     "markdown",
     "atlassian",
     "mermaid",
+    "kroki",
+    "diagrams",
     "model-context-protocol"
   ],
   "license": "MIT"
