@@ -17,10 +17,11 @@ interface UploadedImage {
   height: number;
 }
 
-function getDiagramFileName(diagramType: string, content: string | undefined) {
+function getDiagramFileName(diagramType: string, content: string | undefined, outputFormat: string) {
   const text = content ?? `${diagramType} placeholder`;
   const hash = SparkMD5.hash(text);
-  const uploadFilename = `RenderedKrokiChart-${diagramType}-${hash}.png`;
+  const ext = outputFormat === 'png' ? 'png' : 'svg';
+  const uploadFilename = `RenderedKrokiChart-${diagramType}-${hash}.${ext}`;
   return { uploadFilename, text };
 }
 
@@ -30,7 +31,7 @@ export class KrokiDiagramPlugin
   constructor(
     private diagramType: string,
     private client: KrokiClient,
-    private outputFormat: string = 'png'
+    private outputFormat: string = 'svg'
   ) {}
 
   extract(adf: JSONDocNode): ChartData[] {
@@ -45,7 +46,8 @@ export class KrokiDiagramPlugin
       nodes.map((node) => {
         const details = getDiagramFileName(
           this.diagramType,
-          node?.content?.at(0)?.text
+          node?.content?.at(0)?.text,
+          this.outputFormat
         );
         return {
           name: details.uploadFilename,
@@ -101,7 +103,7 @@ export class KrokiDiagramPlugin
               return;
             }
 
-            const filename = getDiagramFileName(this.diagramType, content);
+            const filename = getDiagramFileName(this.diagramType, content, this.outputFormat);
             if (!imageMap[filename.uploadFilename]) {
               return;
             }

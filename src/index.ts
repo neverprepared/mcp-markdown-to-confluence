@@ -33,10 +33,30 @@ const KROKI_URL = process.env.KROKI_URL ?? 'http://localhost:8371';
 
 const krokiClient = new KrokiClient(KROKI_URL);
 
+// Diagram types and their preferred output format
+// PNG is preferred when supported; SVG is the universal fallback
+const KROKI_DIAGRAM_CONFIGS: Array<{ type: string; format: 'png' | 'svg' }> = [
+  { type: 'plantuml', format: 'png' },
+  { type: 'graphviz', format: 'png' },
+  { type: 'dot', format: 'png' },
+  { type: 'ditaa', format: 'svg' },
+  { type: 'nomnoml', format: 'svg' },
+  { type: 'd2', format: 'svg' },
+  { type: 'dbml', format: 'svg' },
+  { type: 'erd', format: 'svg' },
+  { type: 'svgbob', format: 'svg' },
+  { type: 'pikchr', format: 'svg' },
+  { type: 'bytefield', format: 'svg' },
+  { type: 'wavedrom', format: 'svg' },
+  { type: 'vega', format: 'svg' },
+  { type: 'vega-lite', format: 'svg' },
+  { type: 'bpmn', format: 'svg' },
+  { type: 'c4plantuml', format: 'png' },
+];
+
 const SUPPORTED_DIAGRAM_TYPES = [
-  'mermaid', 'plantuml', 'graphviz', 'dot', 'd2', 'ditaa', 'nomnoml',
-  'svgbob', 'pikchr', 'bytefield', 'wavedrom', 'vega', 'vega-lite',
-  'excalidraw', 'bpmn', 'erd', 'dbml', 'c4plantuml',
+  'mermaid',
+  ...KROKI_DIAGRAM_CONFIGS.map((c) => c.type),
 ];
 
 // ---------------------------------------------------------------------------
@@ -206,9 +226,9 @@ async function publishMarkdown(
   const finalAdf = await executeADFProcessingPipeline(
     [
       new MermaidRendererPlugin(new KrokiMermaidRenderer(krokiClient)),
-      ...SUPPORTED_DIAGRAM_TYPES
-        .filter((t) => t !== 'mermaid')
-        .map((t) => new KrokiDiagramPlugin(t, krokiClient)),
+      ...KROKI_DIAGRAM_CONFIGS.map(
+        (c) => new KrokiDiagramPlugin(c.type, krokiClient, c.format)
+      ),
     ],
     adf as unknown as any,
     publisherFunctions
