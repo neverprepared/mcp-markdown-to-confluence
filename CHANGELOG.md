@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.3](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.2...v1.1.3) (2026-04-03)
+
+
+### Bug Fixes
+
+* sync package-lock.json with release version bump ([5a4a073](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/5a4a0738b0eb2853b5644b99c0c6a83ff1567489))
+
 ## [1.1.2](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.1...v1.1.2) (2026-04-03)
 
 
