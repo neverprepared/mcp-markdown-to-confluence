@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.3...v1.1.4) (2026-04-03)
+
+
+### Bug Fixes
+
+* use npm install in publish workflow and regenerate lockfile ([151b13b](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/151b13bac4879ecf65986bea649e1ec8cfe272ac))
+
 ## [1.1.3](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.2...v1.1.3) (2026-04-03)
 
 
