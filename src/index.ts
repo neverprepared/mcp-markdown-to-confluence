@@ -289,6 +289,40 @@ async function scanDirectoryTree(
 }
 
 // ---------------------------------------------------------------------------
+// Wiki link resolution
+// ---------------------------------------------------------------------------
+
+// Matches [[Page Name]] and [[Page Name#Heading]] and [[Page Name|Display Text]]
+const WIKI_LINK_RE = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g;
+
+function hasWikiLinks(markdown: string): boolean {
+  return WIKI_LINK_RE.test(markdown);
+}
+
+function resolveWikiLinks(
+  markdown: string,
+  titleToUrl: Map<string, string>,
+): string {
+  return markdown.replace(WIKI_LINK_RE, (_match, pageName: string, heading?: string, displayText?: string) => {
+    const trimmedName = pageName.trim();
+    const url = titleToUrl.get(trimmedName);
+
+    if (!url) {
+      // No matching page found — leave as plain text
+      return displayText?.trim() || trimmedName;
+    }
+
+    const label = displayText?.trim() || trimmedName;
+    const anchor = heading?.trim();
+    const anchorSuffix = anchor
+      ? '#' + anchor.replace(/\s+/g, '-')
+      : '';
+
+    return `[${label}](${url}${anchorSuffix})`;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Core publish logic
 // ---------------------------------------------------------------------------
 
@@ -897,6 +931,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         allResults.push(...levelResults);
       }
 
+      // Second pass: resolve wiki links [[Page Name]] and [[Page Name#Heading]]
+      // Build title → URL map from all successfully published pages
+      const titleToUrl = new Map<string, string>();
+      for (const r of allResults) {
+        if (r.success && r.url) {
+          titleToUrl.set(r.title, r.url);
+        }
+      }
+
+      // Find nodes with wiki links that need re-publishing
+      const nodesWithLinks = nodes.filter(
+        (n) => n.markdownFile && hasWikiLinks(n.markdownFile.content) && n.resolvedPageId
+      );
+
+      if (nodesWithLinks.length > 0 && titleToUrl.size > 0) {
+        const linkResults = await Promise.all(
+          nodesWithLinks.map((node) =>
+            limit(async () => {
+              try {
+                const resolvedMarkdown = resolveWikiLinks(
+                  node.markdownFile!.content,
+                  titleToUrl
+                );
+                const result = await publishMarkdown(
+                  resolvedMarkdown,
+                  node.title,
+                  input.spaceKey,
+                  node.resolvedPageId,
+                  undefined, // don't reparent on second pass
+                  true
+                );
+                return { relativePath: node.relativePath, title: node.title, success: true, version: result.version };
+              } catch {
+                return { relativePath: node.relativePath, title: node.title, success: false };
+              }
+            })
+          )
+        );
+
+        const linkedCount = linkResults.filter((r) => r.success).length;
+        if (linkedCount > 0) {
+          // Update versions in allResults
+          for (const lr of linkResults) {
+            if (lr.success && lr.version) {
+              const existing = allResults.find((r) => r.relativePath === lr.relativePath);
+              if (existing) existing.version = lr.version;
+            }
+          }
+        }
+      }
+
       // Build summary
       const succeeded = allResults.filter((r) => r.success);
       const failed = allResults.filter((r) => !r.success);
@@ -905,7 +990,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         `=== DIRECTORY PUBLISH RESULTS ===`,
         `Directory: ${input.directoryPath}`,
         `Space: ${input.spaceKey}`,
-        `Succeeded: ${succeeded.length} | Failed: ${failed.length} | Skipped: ${skipped.length}`,
+        `Succeeded: ${succeeded.length} | Failed: ${failed.length} | Skipped: ${skipped.length}` +
+          (nodesWithLinks.length > 0 ? ` | Wiki links resolved: ${nodesWithLinks.length} page(s)` : ''),
         '',
       ];
 
