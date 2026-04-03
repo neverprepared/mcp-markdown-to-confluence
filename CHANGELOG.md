@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.3.0...v1.4.0) (2026-04-03)
+
+
+### Features
+
+* resolve Obsidian wiki links to Confluence page links ([9fef5c8](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/9fef5c83381e491ba1c5b99db364b90a70f93420))
+
 ## [1.3.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.2.0...v1.3.0) (2026-04-03)
 
 
