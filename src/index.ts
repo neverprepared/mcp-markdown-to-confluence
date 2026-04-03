@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { ConfluenceClient } from 'confluence.js';
 import matter from 'gray-matter';
 import { readFile, readdir } from 'fs/promises';
-import { join, extname, basename } from 'path';
+import { join, extname, basename, relative } from 'path';
 
 // Deep imports to avoid loading adaptors/filesystem.js which has broken CJS named exports.
 // Pin @markdown-confluence/lib version if these paths change.
@@ -158,13 +158,15 @@ interface ParsedMarkdownFile {
 }
 
 async function parseMarkdownFile(
-  filePath: string
+  filePath: string,
+  overrides?: { spaceKey?: string; titleFallback?: string }
 ): Promise<ParsedMarkdownFile | { skipped: true; filePath: string; reason: string }> {
   const raw = await readFile(filePath, 'utf-8');
   const parsed = matter(raw);
 
-  const title: string = parsed.data['connie-title'] ?? parsed.data['title'] ?? '';
-  const spaceKey: string = parsed.data['connie-space-key'] ?? '';
+  const title: string =
+    parsed.data['connie-title'] ?? parsed.data['title'] ?? overrides?.titleFallback ?? '';
+  const spaceKey: string = overrides?.spaceKey ?? parsed.data['connie-space-key'] ?? '';
   const pageId: string | undefined = parsed.data['connie-page-id']
     ? String(parsed.data['connie-page-id'])
     : undefined;
@@ -177,6 +179,113 @@ async function parseMarkdownFile(
   }
 
   return { filePath, title, spaceKey, pageId, content: parsed.content };
+}
+
+// ---------------------------------------------------------------------------
+// Directory tree scanning
+// ---------------------------------------------------------------------------
+
+interface DirectoryNode {
+  relativePath: string;
+  title: string;
+  depth: number;
+  parentRelativePath: string | null;
+  markdownFile?: ParsedMarkdownFile;
+  isDirectory: boolean;
+  resolvedPageId?: string;
+}
+
+async function scanDirectoryTree(
+  rootPath: string,
+  spaceKey: string,
+  currentPath: string = rootPath,
+  depth: number = 0,
+): Promise<{
+  nodes: DirectoryNode[];
+  skipped: Array<{ filePath: string; reason: string }>;
+}> {
+  const entries = await readdir(currentPath, { withFileTypes: true });
+  const nodes: DirectoryNode[] = [];
+  const skipped: Array<{ filePath: string; reason: string }> = [];
+
+  const relFromRoot = relative(rootPath, currentPath) || '.';
+  const parentRel = depth === 0 ? null : (relative(rootPath, join(currentPath, '..')) || '.');
+
+  // Collect subdirectories and markdown files
+  const subdirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+  const mdFiles = entries.filter(
+    (e) => e.isFile() && extname(e.name).toLowerCase() === '.md' && !e.name.startsWith('.')
+  );
+
+  // Check for markdown files that correspond to subdirectories (e.g., "01 - Strategic.md" + "01 - Strategic/")
+  const subdirNames = new Set(subdirs.map((d) => d.name));
+  const dirMdFiles = new Set<string>();
+
+  // Process markdown files
+  for (const entry of mdFiles) {
+    const filePath = join(currentPath, entry.name);
+    const stem = basename(entry.name, extname(entry.name));
+
+    // If this .md file has a matching subdirectory, it will be used as the directory's content
+    if (subdirNames.has(stem)) {
+      dirMdFiles.add(stem);
+      continue; // handled when processing the subdirectory
+    }
+
+    const result = await parseMarkdownFile(filePath, {
+      spaceKey,
+      titleFallback: stem,
+    });
+
+    if ('skipped' in result) {
+      skipped.push(result);
+    } else {
+      nodes.push({
+        relativePath: relative(rootPath, filePath),
+        title: result.title,
+        depth,
+        parentRelativePath: depth === 0 ? null : relFromRoot,
+        markdownFile: result,
+        isDirectory: false,
+      });
+    }
+  }
+
+  // Process subdirectories
+  for (const dir of subdirs) {
+    const dirPath = join(currentPath, dir.name);
+    const dirRelPath = relative(rootPath, dirPath);
+
+    // Check for a matching .md file to use as directory content
+    const matchingMdPath = join(currentPath, dir.name + '.md');
+    let dirMarkdownFile: ParsedMarkdownFile | undefined;
+
+    if (dirMdFiles.has(dir.name)) {
+      const result = await parseMarkdownFile(matchingMdPath, {
+        spaceKey,
+        titleFallback: dir.name,
+      });
+      if (!('skipped' in result)) {
+        dirMarkdownFile = result;
+      }
+    }
+
+    nodes.push({
+      relativePath: dirRelPath,
+      title: dirMarkdownFile?.title ?? dir.name,
+      depth,
+      parentRelativePath: depth === 0 ? null : relFromRoot,
+      markdownFile: dirMarkdownFile,
+      isDirectory: true,
+    });
+
+    // Recurse
+    const subResult = await scanDirectoryTree(rootPath, spaceKey, dirPath, depth + 1);
+    nodes.push(...subResult.nodes);
+    skipped.push(...subResult.skipped);
+  }
+
+  return { nodes, skipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -393,14 +502,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'markdown_publish_directory',
       description:
-        'Scan a directory for markdown files with Confluence frontmatter and publish them all concurrently. ' +
-        'Files without required frontmatter (connie-title, connie-space-key) are skipped.',
+        'Recursively scan a directory and publish markdown files as a Confluence page tree, ' +
+        'mirroring the folder structure. Directories become parent pages; markdown files become child pages. ' +
+        'Existing pages (with connie-page-id) are updated and reparented to match the directory structure.',
       inputSchema: {
         type: 'object',
         properties: {
           directoryPath: {
             type: 'string',
-            description: 'Absolute path to the directory containing markdown files',
+            description: 'Absolute path to the root directory',
+          },
+          spaceKey: {
+            type: 'string',
+            description: 'Confluence space key. Overrides file-level connie-space-key.',
+          },
+          rootPageId: {
+            type: 'string',
+            description: 'Existing Confluence page ID to use as the root parent. If omitted, a new root page is created.',
           },
           skip_preview: {
             type: 'boolean',
@@ -409,11 +527,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           concurrency: {
             type: 'number',
-            description: 'Maximum number of files to publish concurrently (default: 5)',
+            description: 'Maximum concurrent publishes per depth level (default: 5)',
             default: 5,
           },
         },
-        required: ['directoryPath'],
+        required: ['directoryPath', 'spaceKey'],
       },
     },
   ],
@@ -587,70 +705,80 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const input = z
         .object({
           directoryPath: z.string(),
+          spaceKey: z.string(),
+          rootPageId: z.string().optional(),
           skip_preview: z.boolean().default(false),
           concurrency: z.number().int().min(1).max(20).default(5),
         })
         .parse(args);
 
-      const entries = await readdir(input.directoryPath);
-      const mdFiles = entries
-        .filter((f) => extname(f).toLowerCase() === '.md')
-        .map((f) => join(input.directoryPath, f));
+      // Scan directory tree
+      const { nodes, skipped } = await scanDirectoryTree(
+        input.directoryPath,
+        input.spaceKey
+      );
 
-      if (mdFiles.length === 0) {
+      if (nodes.length === 0 && skipped.length === 0) {
         return {
-          content: [{ type: 'text', text: `No .md files found in ${input.directoryPath}` }],
+          content: [{ type: 'text', text: `No files found in ${input.directoryPath}` }],
         };
       }
 
-      const parseResults = await Promise.all(mdFiles.map(parseMarkdownFile));
-      const valid: ParsedMarkdownFile[] = [];
-      const skipped: Array<{ filePath: string; reason: string }> = [];
-
-      for (const r of parseResults) {
-        if ('skipped' in r) {
-          skipped.push(r);
-        } else {
-          valid.push(r);
-        }
-      }
-
+      // Preview mode
       if (!input.skip_preview) {
+        const rootTitle = input.rootPageId
+          ? `(existing page: ${input.rootPageId})`
+          : `"${basename(input.directoryPath)}" (will be created)`;
+
         const lines: string[] = [
-          `=== DIRECTORY PREVIEW ===`,
+          `=== DIRECTORY TREE PREVIEW ===`,
           `Directory: ${input.directoryPath}`,
-          `Total .md files: ${mdFiles.length}`,
-          `Files to publish: ${valid.length}`,
-          `Files skipped: ${skipped.length}`,
+          `Space: ${input.spaceKey}`,
+          `Root page: ${rootTitle}`,
+          `Total pages: ${nodes.length + (input.rootPageId ? 0 : 1)}`,
           '',
-          '--- Files to publish ---',
+          '--- Page tree ---',
         ];
-        for (const f of valid) {
-          const adf = parseMarkdownToADF(f.content, CONFLUENCE_BASE_URL) as any;
-          const diagrams = countDiagramBlocks(adf);
-          lines.push(`  ${basename(f.filePath)}`);
-          lines.push(
-            `    Title: ${f.title} | Space: ${f.spaceKey}` +
-              (f.pageId ? ` | Page ID: ${f.pageId}` : ' (new page)') +
-              (diagrams > 0 ? ` | Diagrams: ${diagrams}` : '')
-          );
+
+        // Build tree visualization
+        const maxDepth = nodes.reduce((max, n) => Math.max(max, n.depth), 0);
+        for (let d = 0; d <= maxDepth; d++) {
+          for (const node of nodes.filter((n) => n.depth === d)) {
+            const indent = '  '.repeat(d + 1);
+            const suffix = node.isDirectory ? '/' : '';
+            const pageInfo = node.markdownFile?.pageId
+              ? `update: ${node.markdownFile.pageId}`
+              : 'new page';
+            let diagrams = '';
+            if (node.markdownFile) {
+              const adf = parseMarkdownToADF(node.markdownFile.content, CONFLUENCE_BASE_URL) as any;
+              const count = countDiagramBlocks(adf);
+              if (count > 0) diagrams = `, ${count} diagram(s)`;
+            }
+            const label = node.isDirectory && !node.markdownFile ? 'placeholder' : pageInfo;
+            lines.push(`${indent}${node.title}${suffix} (${label}${diagrams})`);
+          }
         }
+
         if (skipped.length > 0) {
           lines.push('', '--- Skipped files ---');
           for (const s of skipped) {
             lines.push(`  ${basename(s.filePath)}: ${s.reason}`);
           }
         }
-        lines.push('', `Call again with skip_preview: true to publish all ${valid.length} file(s).`);
+
+        lines.push('', `Call again with skip_preview: true to publish.`);
         return { content: [{ type: 'text', text: lines.join('\n') }] };
       }
 
+      // Publish mode — process level by level
       const limit = pLimit(input.concurrency);
 
       interface FileResult {
-        filePath: string;
+        relativePath: string;
         title: string;
         success: boolean;
+        isDirectory: boolean;
         pageId?: string;
         version?: number;
         diagramCount?: number;
@@ -658,45 +786,125 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         error?: string;
       }
 
-      const results: FileResult[] = await Promise.all(
-        valid.map((f) =>
-          limit(async (): Promise<FileResult> => {
-            try {
-              const result = await publishMarkdown(
-                f.content,
-                f.title,
-                f.spaceKey,
-                f.pageId,
-                undefined,
-                true
-              );
-              return {
-                filePath: f.filePath,
-                title: f.title,
-                success: true,
-                pageId: result.pageId,
-                version: result.version,
-                diagramCount: result.diagramCount,
-                url: result.url,
-              };
-            } catch (err: unknown) {
-              return {
-                filePath: f.filePath,
-                title: f.title,
-                success: false,
-                error: err instanceof Error ? err.message : String(err),
-              };
-            }
-          })
-        )
-      );
+      // Create or resolve root page
+      let rootPageId = input.rootPageId;
+      const allResults: FileResult[] = [];
 
-      const succeeded = results.filter((r) => r.success);
-      const failed = results.filter((r) => !r.success);
+      if (!rootPageId) {
+        try {
+          const rootResult = await publishMarkdown(
+            '',
+            basename(input.directoryPath),
+            input.spaceKey,
+            undefined,
+            undefined,
+            true
+          );
+          rootPageId = rootResult.pageId;
+          allResults.push({
+            relativePath: '.',
+            title: basename(input.directoryPath),
+            success: true,
+            isDirectory: true,
+            pageId: rootResult.pageId,
+            version: rootResult.version,
+            url: rootResult.url,
+          });
+        } catch (err: unknown) {
+          return {
+            isError: true,
+            content: [{
+              type: 'text',
+              text: `Error creating root page: ${err instanceof Error ? err.message : String(err)}`,
+            }],
+          };
+        }
+      }
+
+      // Build a map from relativePath to node for parent lookups
+      const nodeMap = new Map<string, DirectoryNode>();
+      for (const node of nodes) {
+        nodeMap.set(node.relativePath, node);
+      }
+
+      // Group by depth and process level by level
+      const maxDepth = nodes.reduce((max, n) => Math.max(max, n.depth), 0);
+
+      for (let depth = 0; depth <= maxDepth; depth++) {
+        const levelNodes = nodes.filter((n) => n.depth === depth);
+
+        const levelResults = await Promise.all(
+          levelNodes.map((node) =>
+            limit(async (): Promise<FileResult> => {
+              // Determine parent page ID
+              let parentId: string | undefined;
+              if (node.parentRelativePath === null) {
+                parentId = rootPageId;
+              } else {
+                const parentNode = nodeMap.get(node.parentRelativePath);
+                parentId = parentNode?.resolvedPageId;
+              }
+
+              if (!parentId) {
+                return {
+                  relativePath: node.relativePath,
+                  title: node.title,
+                  success: false,
+                  isDirectory: node.isDirectory,
+                  error: 'Parent page was not created (parent failed)',
+                };
+              }
+
+              try {
+                const content = node.markdownFile?.content ?? '';
+                const pageId = node.markdownFile?.pageId;
+
+                const result = await publishMarkdown(
+                  content,
+                  node.title,
+                  input.spaceKey,
+                  pageId,
+                  parentId,
+                  true
+                );
+
+                // Store resolved page ID for children
+                node.resolvedPageId = result.pageId;
+
+                return {
+                  relativePath: node.relativePath,
+                  title: node.title,
+                  success: true,
+                  isDirectory: node.isDirectory,
+                  pageId: result.pageId,
+                  version: result.version,
+                  diagramCount: result.diagramCount,
+                  url: result.url,
+                };
+              } catch (err: unknown) {
+                return {
+                  relativePath: node.relativePath,
+                  title: node.title,
+                  success: false,
+                  isDirectory: node.isDirectory,
+                  error: err instanceof Error ? err.message : String(err),
+                };
+              }
+            })
+          )
+        );
+
+        allResults.push(...levelResults);
+      }
+
+      // Build summary
+      const succeeded = allResults.filter((r) => r.success);
+      const failed = allResults.filter((r) => !r.success);
 
       const lines: string[] = [
         `=== DIRECTORY PUBLISH RESULTS ===`,
         `Directory: ${input.directoryPath}`,
+        `Space: ${input.spaceKey}`,
         `Succeeded: ${succeeded.length} | Failed: ${failed.length} | Skipped: ${skipped.length}`,
         '',
       ];
@@ -704,15 +912,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (succeeded.length > 0) {
         lines.push('--- Succeeded ---');
         for (const r of succeeded) {
-          lines.push(`  "${r.title}"`);
-          lines.push(`    Page ID: ${r.pageId} | Version: ${r.version} | Diagrams: ${r.diagramCount} | URL: ${r.url}`);
+          const type = r.isDirectory ? ' (folder)' : '';
+          lines.push(`  "${r.title}"${type}`);
+          lines.push(`    Page ID: ${r.pageId} | Version: ${r.version}${r.diagramCount ? ` | Diagrams: ${r.diagramCount}` : ''} | URL: ${r.url}`);
         }
       }
 
       if (failed.length > 0) {
         lines.push('', '--- Failed ---');
         for (const r of failed) {
-          lines.push(`  "${r.title}" (${basename(r.filePath)})`);
+          lines.push(`  "${r.title}" (${r.relativePath})`);
           lines.push(`    Error: ${r.error}`);
         }
       }
