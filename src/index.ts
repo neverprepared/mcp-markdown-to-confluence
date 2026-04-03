@@ -25,7 +25,8 @@ import { KrokiClient, KrokiMermaidRenderer, KrokiDiagramPlugin } from './kroki/i
 // Environment
 // ---------------------------------------------------------------------------
 
-const CONFLUENCE_BASE_URL = process.env.CONFLUENCE_BASE_URL ?? '';
+const CONFLUENCE_BASE_URL = (process.env.CONFLUENCE_URL ?? process.env.CONFLUENCE_BASE_URL ?? '')
+  .replace(/\/wiki\/?$/, '');
 const CONFLUENCE_USERNAME = process.env.CONFLUENCE_USERNAME ?? '';
 const CONFLUENCE_API_TOKEN = process.env.CONFLUENCE_API_TOKEN ?? '';
 const KROKI_URL = process.env.KROKI_URL ?? 'http://localhost:8371';
