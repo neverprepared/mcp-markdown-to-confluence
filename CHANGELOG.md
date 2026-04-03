@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.4...v1.2.0) (2026-04-03)
+
+
+### Features
+
+* add markdown_publish_directory tool for batch publishing ([e01d730](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/e01d73072ce7e1c7bc447e9f0d9b0c36cca82d6d))
+
 ## [1.1.4](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.3...v1.1.4) (2026-04-03)
 
 
