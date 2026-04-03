@@ -7,7 +7,8 @@ import {
 import { z } from 'zod';
 import { ConfluenceClient } from 'confluence.js';
 import matter from 'gray-matter';
-import { readFile } from 'fs/promises';
+import { readFile, readdir } from 'fs/promises';
+import { join, extname, basename } from 'path';
 
 // Deep imports to avoid loading adaptors/filesystem.js which has broken CJS named exports.
 // Pin @markdown-confluence/lib version if these paths change.
@@ -123,6 +124,59 @@ function countDiagramBlocks(adf: unknown): number {
   }
 
   return count;
+}
+
+function pLimit(concurrency: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+
+  function next() {
+    if (queue.length > 0 && active < concurrency) {
+      active++;
+      queue.shift()!();
+    }
+  }
+
+  return <T>(fn: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      queue.push(() => {
+        fn().then(resolve, reject).finally(() => {
+          active--;
+          next();
+        });
+      });
+      next();
+    });
+}
+
+interface ParsedMarkdownFile {
+  filePath: string;
+  title: string;
+  spaceKey: string;
+  pageId?: string;
+  content: string;
+}
+
+async function parseMarkdownFile(
+  filePath: string
+): Promise<ParsedMarkdownFile | { skipped: true; filePath: string; reason: string }> {
+  const raw = await readFile(filePath, 'utf-8');
+  const parsed = matter(raw);
+
+  const title: string = parsed.data['connie-title'] ?? parsed.data['title'] ?? '';
+  const spaceKey: string = parsed.data['connie-space-key'] ?? '';
+  const pageId: string | undefined = parsed.data['connie-page-id']
+    ? String(parsed.data['connie-page-id'])
+    : undefined;
+
+  if (!title) {
+    return { skipped: true, filePath, reason: 'Missing "connie-title" or "title" in frontmatter' };
+  }
+  if (!spaceKey) {
+    return { skipped: true, filePath, reason: 'Missing "connie-space-key" in frontmatter' };
+  }
+
+  return { filePath, title, spaceKey, pageId, content: parsed.content };
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +390,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['filePath'],
       },
     },
+    {
+      name: 'markdown_publish_directory',
+      description:
+        'Scan a directory for markdown files with Confluence frontmatter and publish them all concurrently. ' +
+        'Files without required frontmatter (connie-title, connie-space-key) are skipped.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          directoryPath: {
+            type: 'string',
+            description: 'Absolute path to the directory containing markdown files',
+          },
+          skip_preview: {
+            type: 'boolean',
+            description: 'Set to true to skip preview and publish immediately',
+            default: false,
+          },
+          concurrency: {
+            type: 'number',
+            description: 'Maximum number of files to publish concurrently (default: 5)',
+            default: 5,
+          },
+        },
+        required: ['directoryPath'],
+      },
+    },
   ],
 }));
 
@@ -501,6 +581,150 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
         ],
       };
+    }
+
+    if (name === 'markdown_publish_directory') {
+      const input = z
+        .object({
+          directoryPath: z.string(),
+          skip_preview: z.boolean().default(false),
+          concurrency: z.number().int().min(1).max(20).default(5),
+        })
+        .parse(args);
+
+      const entries = await readdir(input.directoryPath);
+      const mdFiles = entries
+        .filter((f) => extname(f).toLowerCase() === '.md')
+        .map((f) => join(input.directoryPath, f));
+
+      if (mdFiles.length === 0) {
+        return {
+          content: [{ type: 'text', text: `No .md files found in ${input.directoryPath}` }],
+        };
+      }
+
+      const parseResults = await Promise.all(mdFiles.map(parseMarkdownFile));
+      const valid: ParsedMarkdownFile[] = [];
+      const skipped: Array<{ filePath: string; reason: string }> = [];
+
+      for (const r of parseResults) {
+        if ('skipped' in r) {
+          skipped.push(r);
+        } else {
+          valid.push(r);
+        }
+      }
+
+      if (!input.skip_preview) {
+        const lines: string[] = [
+          `=== DIRECTORY PREVIEW ===`,
+          `Directory: ${input.directoryPath}`,
+          `Total .md files: ${mdFiles.length}`,
+          `Files to publish: ${valid.length}`,
+          `Files skipped: ${skipped.length}`,
+          '',
+          '--- Files to publish ---',
+        ];
+        for (const f of valid) {
+          const adf = parseMarkdownToADF(f.content, CONFLUENCE_BASE_URL) as any;
+          const diagrams = countDiagramBlocks(adf);
+          lines.push(`  ${basename(f.filePath)}`);
+          lines.push(
+            `    Title: ${f.title} | Space: ${f.spaceKey}` +
+              (f.pageId ? ` | Page ID: ${f.pageId}` : ' (new page)') +
+              (diagrams > 0 ? ` | Diagrams: ${diagrams}` : '')
+          );
+        }
+        if (skipped.length > 0) {
+          lines.push('', '--- Skipped files ---');
+          for (const s of skipped) {
+            lines.push(`  ${basename(s.filePath)}: ${s.reason}`);
+          }
+        }
+        lines.push('', `Call again with skip_preview: true to publish all ${valid.length} file(s).`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      const limit = pLimit(input.concurrency);
+
+      interface FileResult {
+        filePath: string;
+        title: string;
+        success: boolean;
+        pageId?: string;
+        version?: number;
+        diagramCount?: number;
+        url?: string;
+        error?: string;
+      }
+
+      const results: FileResult[] = await Promise.all(
+        valid.map((f) =>
+          limit(async (): Promise<FileResult> => {
+            try {
+              const result = await publishMarkdown(
+                f.content,
+                f.title,
+                f.spaceKey,
+                f.pageId,
+                undefined,
+                true
+              );
+              return {
+                filePath: f.filePath,
+                title: f.title,
+                success: true,
+                pageId: result.pageId,
+                version: result.version,
+                diagramCount: result.diagramCount,
+                url: result.url,
+              };
+            } catch (err: unknown) {
+              return {
+                filePath: f.filePath,
+                title: f.title,
+                success: false,
+                error: err instanceof Error ? err.message : String(err),
+              };
+            }
+          })
+        )
+      );
+
+      const succeeded = results.filter((r) => r.success);
+      const failed = results.filter((r) => !r.success);
+
+      const lines: string[] = [
+        `=== DIRECTORY PUBLISH RESULTS ===`,
+        `Directory: ${input.directoryPath}`,
+        `Succeeded: ${succeeded.length} | Failed: ${failed.length} | Skipped: ${skipped.length}`,
+        '',
+      ];
+
+      if (succeeded.length > 0) {
+        lines.push('--- Succeeded ---');
+        for (const r of succeeded) {
+          lines.push(`  "${r.title}"`);
+          lines.push(`    Page ID: ${r.pageId} | Version: ${r.version} | Diagrams: ${r.diagramCount} | URL: ${r.url}`);
+        }
+      }
+
+      if (failed.length > 0) {
+        lines.push('', '--- Failed ---');
+        for (const r of failed) {
+          lines.push(`  "${r.title}" (${basename(r.filePath)})`);
+          lines.push(`    Error: ${r.error}`);
+        }
+      }
+
+      if (skipped.length > 0) {
+        lines.push('', '--- Skipped (invalid frontmatter) ---');
+        for (const s of skipped) {
+          lines.push(`  ${basename(s.filePath)}: ${s.reason}`);
+        }
+      }
+
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
     return {
