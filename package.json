@@ -5,21 +5,22 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mcp-markdown-to-confluence": "dist/index.js"
+    "mcp-markdown-to-confluence": "bin/mcp-markdown-to-confluence.js"
   },
   "files": [
+    "bin",
     "dist",
     "docker",
     "scripts"
   ],
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "node --watch dist/index.js",
+    "build": "tsc && cp src/loader.js dist/loader.js",
+    "start": "node bin/mcp-markdown-to-confluence.js",
+    "dev": "node --watch bin/mcp-markdown-to-confluence.js",
     "postinstall": "sh scripts/postinstall.sh"
   },
   "dependencies": {
-    "@markdown-confluence/lib": "^5.5.2",
+    "@markdown-confluence/lib": "5.5.2",
     "@modelcontextprotocol/sdk": "^1.10.1",
     "confluence.js": "^1.6.3",
     "gray-matter": "^4.0.3",

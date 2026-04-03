@@ -9,13 +9,15 @@ import { ConfluenceClient } from 'confluence.js';
 import matter from 'gray-matter';
 import { readFile } from 'fs/promises';
 
+// Deep imports to avoid loading adaptors/filesystem.js which has broken CJS named exports.
+// Pin @markdown-confluence/lib version if these paths change.
+import { parseMarkdownToADF } from '@markdown-confluence/lib/dist/MdToADF.js';
+import { renderADFDoc } from '@markdown-confluence/lib/dist/ADFToMarkdown.js';
 import {
-  parseMarkdownToADF,
-  renderADFDoc,
   executeADFProcessingPipeline,
   createPublisherFunctions,
-  MermaidRendererPlugin,
-} from '@markdown-confluence/lib';
+} from '@markdown-confluence/lib/dist/ADFProcessingPlugins/types.js';
+import { MermaidRendererPlugin } from '@markdown-confluence/lib/dist/ADFProcessingPlugins/MermaidRendererPlugin.js';
 import { KrokiClient, KrokiMermaidRenderer, KrokiDiagramPlugin } from './kroki/index.js';
 
 // ---------------------------------------------------------------------------
@@ -87,7 +89,7 @@ const stubAdaptor = {
     _fileName: string,
     _mimeType: string
   ) => undefined,
-} as unknown as import('@markdown-confluence/lib').LoaderAdaptor;
+} as unknown as import('@markdown-confluence/lib/dist/adaptors/index.js').LoaderAdaptor;
 
 // ---------------------------------------------------------------------------
 // Helpers
