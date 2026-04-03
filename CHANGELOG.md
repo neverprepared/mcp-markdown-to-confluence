@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.4.0...v1.4.1) (2026-04-03)
+
+
+### Bug Fixes
+
+* align env vars with Atlassian MCP and strip /wiki suffix ([59b8a90](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/59b8a90fbad031a324cb801e980a71b7730e1a26))
+
 ## [1.4.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.3.0...v1.4.0) (2026-04-03)
 
 
