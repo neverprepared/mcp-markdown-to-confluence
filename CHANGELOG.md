@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.2.0...v1.3.0) (2026-04-03)
+
+
+### Features
+
+* recursive directory publishing with page tree mirroring ([131e870](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/131e870b4d16a1a7c6d1273e7dc542b6dbb7db57))
+
 ## [1.2.0](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.1.4...v1.2.0) (2026-04-03)
 
 
