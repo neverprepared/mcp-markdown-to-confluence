@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.4.1...v1.4.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* security hardening, performance improvements, and code quality ([b6e9cdd](https://github.com/neverprepared/mcp-markdown-to-confluence/commit/b6e9cdd9b7c5792b3d8ac13bf764569fe8ef5b1e))
+
 ## [1.4.1](https://github.com/neverprepared/mcp-markdown-to-confluence/compare/v1.4.0...v1.4.1) (2026-04-03)
 
 
