@@ -7,8 +7,8 @@ import {
 import { z } from 'zod';
 import { ConfluenceClient } from 'confluence.js';
 import matter from 'gray-matter';
-import { readFile, readdir } from 'fs/promises';
-import { join, extname, basename, relative } from 'path';
+import { readFile, readdir, realpath } from 'fs/promises';
+import { join, extname, basename, relative, isAbsolute } from 'path';
 
 // Deep imports to avoid loading adaptors/filesystem.js which has broken CJS named exports.
 // Pin @markdown-confluence/lib version if these paths change.
@@ -25,11 +25,19 @@ import { KrokiClient, KrokiMermaidRenderer, KrokiDiagramPlugin } from './kroki/i
 // Environment
 // ---------------------------------------------------------------------------
 
-const CONFLUENCE_BASE_URL = (process.env.CONFLUENCE_URL ?? process.env.CONFLUENCE_BASE_URL ?? '')
+const CONFLUENCE_BASE_URL = (process.env.CONFLUENCE_URL ?? '')
   .replace(/\/wiki\/?$/, '');
 const CONFLUENCE_USERNAME = process.env.CONFLUENCE_USERNAME ?? '';
 const CONFLUENCE_API_TOKEN = process.env.CONFLUENCE_API_TOKEN ?? '';
 const KROKI_URL = process.env.KROKI_URL ?? 'http://localhost:8371';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const ADF_CONTENT_TYPE = 'atlas_doc_format' as const;
+const DEFAULT_PUBLISH_CONCURRENCY = 5;
+const MAX_PUBLISH_CONCURRENCY = 20;
 
 // ---------------------------------------------------------------------------
 // Kroki client
@@ -78,9 +86,21 @@ const confluenceClient = new ConfluenceClient({
 });
 
 // ---------------------------------------------------------------------------
-// Stub LoaderAdaptor — only uploadBuffer is called by the mermaid plugin
+// Helpers
 // ---------------------------------------------------------------------------
 
+/** Extracts a readable message from an unknown thrown value. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ---------------------------------------------------------------------------
+// Stub LoaderAdaptor
+// ---------------------------------------------------------------------------
+
+// The LoaderAdaptor interface requires all methods below, but in MCP context
+// only uploadBuffer is ever invoked (by the diagram pipeline). The remaining
+// methods are stubs required for type compatibility.
 const stubAdaptor = {
   readFile: async (_filePath: string) => undefined,
   readBinary: async (_filePath: string) => false as const,
@@ -93,9 +113,15 @@ const stubAdaptor = {
   ) => undefined,
 } as unknown as import('@markdown-confluence/lib/dist/adaptors/index.js').LoaderAdaptor;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+/**
+ * Lightweight diagram count over raw markdown — scans for fenced code block
+ * openings matching a supported diagram type. Used during preview mode to avoid
+ * a full ADF parse just to display a diagram count.
+ */
+const DIAGRAM_FENCE_TYPES = SUPPORTED_DIAGRAM_TYPES.join('|');
+function countDiagramsInMarkdown(markdown: string): number {
+  return (markdown.match(new RegExp(`^\`\`\`(?:${DIAGRAM_FENCE_TYPES})[ \\t]*$`, 'gm')) ?? []).length;
+}
 
 function countDiagramBlocks(adf: unknown): number {
   if (typeof adf !== 'object' || adf === null) return 0;
@@ -158,6 +184,24 @@ interface ParsedMarkdownFile {
   content: string;
 }
 
+/**
+ * Validates that a user-supplied path is safe to access.
+ * - Must be absolute (prevents relative traversal)
+ * - Must not contain ".." segments (belt-and-suspenders before realpath)
+ * - Resolves symlinks and normalizes via realpath (the canonical defense)
+ * Returns the canonicalized path, or throws if the path is invalid.
+ */
+async function validatePath(inputPath: string): Promise<string> {
+  if (!isAbsolute(inputPath)) {
+    throw new Error(`Path must be absolute: "${inputPath}"`);
+  }
+  if (inputPath.includes('..')) {
+    throw new Error(`Path must not contain ".." segments: "${inputPath}"`);
+  }
+  // realpath resolves symlinks and normalizes — throws ENOENT if path doesn't exist
+  return realpath(inputPath);
+}
+
 async function parseMarkdownFile(
   filePath: string,
   overrides?: { spaceKey?: string; titleFallback?: string }
@@ -193,7 +237,6 @@ interface DirectoryNode {
   parentRelativePath: string | null;
   markdownFile?: ParsedMarkdownFile;
   isDirectory: boolean;
-  resolvedPageId?: string;
 }
 
 async function scanDirectoryTree(
@@ -210,7 +253,10 @@ async function scanDirectoryTree(
   const skipped: Array<{ filePath: string; reason: string }> = [];
 
   const relFromRoot = relative(rootPath, currentPath) || '.';
-  const parentRel = depth === 0 ? null : (relative(rootPath, join(currentPath, '..')) || '.');
+  // Derive parent path from relFromRoot instead of calling join+relative again.
+  const parentRel = depth === 0 ? null : (
+    relFromRoot.includes('/') ? relFromRoot.substring(0, relFromRoot.lastIndexOf('/')) : '.'
+  );
 
   // Collect subdirectories and markdown files
   const subdirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith('.'));
@@ -220,16 +266,21 @@ async function scanDirectoryTree(
 
   // Check for markdown files that correspond to subdirectories (e.g., "01 - Strategic.md" + "01 - Strategic/")
   const subdirNames = new Set(subdirs.map((d) => d.name));
-  const dirMdFiles = new Set<string>();
+  // Cache parsed results for dir-matching .md files so we don't read them twice.
+  const parsedDirMd = new Map<string, ParsedMarkdownFile>();
 
   // Process markdown files
   for (const entry of mdFiles) {
     const filePath = join(currentPath, entry.name);
     const stem = basename(entry.name, extname(entry.name));
 
-    // If this .md file has a matching subdirectory, it will be used as the directory's content
+    // If this .md file has a matching subdirectory, parse and cache it now so
+    // the subdir loop below can reuse the result without a second disk read.
     if (subdirNames.has(stem)) {
-      dirMdFiles.add(stem);
+      const result = await parseMarkdownFile(filePath, { spaceKey, titleFallback: stem });
+      if (!('skipped' in result)) {
+        parsedDirMd.set(stem, result);
+      }
       continue; // handled when processing the subdirectory
     }
 
@@ -257,19 +308,8 @@ async function scanDirectoryTree(
     const dirPath = join(currentPath, dir.name);
     const dirRelPath = relative(rootPath, dirPath);
 
-    // Check for a matching .md file to use as directory content
-    const matchingMdPath = join(currentPath, dir.name + '.md');
-    let dirMarkdownFile: ParsedMarkdownFile | undefined;
-
-    if (dirMdFiles.has(dir.name)) {
-      const result = await parseMarkdownFile(matchingMdPath, {
-        spaceKey,
-        titleFallback: dir.name,
-      });
-      if (!('skipped' in result)) {
-        dirMarkdownFile = result;
-      }
-    }
+    // Reuse the cached parse result from the first loop (avoids a second disk read).
+    const dirMarkdownFile = parsedDirMd.get(dir.name);
 
     nodes.push({
       relativePath: dirRelPath,
@@ -294,17 +334,20 @@ async function scanDirectoryTree(
 // ---------------------------------------------------------------------------
 
 // Matches [[Page Name]] and [[Page Name#Heading]] and [[Page Name|Display Text]]
-const WIKI_LINK_RE = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g;
+// Two separate regex instances: WIKI_LINK_RE_TEST (no /g) is stateless and safe for .test();
+// WIKI_LINK_RE_REPLACE (with /g) is used only by String.replace() which resets lastIndex itself.
+const WIKI_LINK_RE_TEST = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/;
+const WIKI_LINK_RE_REPLACE = /\[\[([^\]|#]+)(?:#([^\]|]+))?(?:\|([^\]]+))?\]\]/g;
 
 function hasWikiLinks(markdown: string): boolean {
-  return WIKI_LINK_RE.test(markdown);
+  return WIKI_LINK_RE_TEST.test(markdown);
 }
 
 function resolveWikiLinks(
   markdown: string,
   titleToUrl: Map<string, string>,
 ): string {
-  return markdown.replace(WIKI_LINK_RE, (_match, pageName: string, heading?: string, displayText?: string) => {
+  return markdown.replace(WIKI_LINK_RE_REPLACE, (_match, pageName: string, heading?: string, displayText?: string) => {
     const trimmedName = pageName.trim();
     const url = titleToUrl.get(trimmedName);
 
@@ -327,6 +370,66 @@ function resolveWikiLinks(
 // Core publish logic
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetches the current version of an existing page, or creates a blank placeholder
+ * page and returns its new ID and version. Extracted from publishMarkdown to keep
+ * that function focused on the ADF pipeline.
+ */
+async function getOrCreatePage(
+  pageId: string | undefined,
+  spaceKey: string,
+  title: string,
+  parentId: string | undefined,
+): Promise<{ resolvedPageId: string; currentVersion: number }> {
+  if (pageId) {
+    const existingPage = await confluenceClient.content.getContentById({
+      id: pageId,
+      expand: ['version'],
+    });
+    const version = existingPage.version?.number;
+    if (version === undefined) {
+      throw new Error(`Could not read version for page ${pageId} — Confluence returned no version info`);
+    }
+    return { resolvedPageId: pageId, currentVersion: version };
+  }
+
+  // No existing page — create a blank placeholder to obtain a pageId, then
+  // update it with the real content in the caller.
+  const blankAdf = { version: 1, type: 'doc', content: [] };
+  const createParams: Parameters<typeof confluenceClient.content.createContent>[0] = {
+    space: { key: spaceKey },
+    title,
+    type: 'page',
+    body: {
+      [ADF_CONTENT_TYPE]: {
+        value: JSON.stringify(blankAdf),
+        representation: ADF_CONTENT_TYPE,
+      },
+    },
+  };
+  if (parentId) {
+    createParams.ancestors = [{ id: parentId }];
+  }
+
+  const created = await confluenceClient.content.createContent(createParams);
+  const resolvedPageId = created.id;
+  const currentVersion = created.version?.number;
+  if (!resolvedPageId || currentVersion === undefined) {
+    throw new Error('Failed to create page: Confluence response is missing id or version');
+  }
+  return { resolvedPageId, currentVersion };
+}
+
+type CurrentAttachments = Record<
+  string,
+  { filehash: string; attachmentId: string; collectionName: string }
+>;
+
+// Session-level cache: avoids re-fetching attachments for the same page during
+// the wiki-link second-pass (where publishMarkdown is called again for pages
+// that were already published in the first pass).
+const attachmentCache = new Map<string, CurrentAttachments>();
+
 async function publishMarkdown(
   markdown: string,
   title: string,
@@ -335,87 +438,49 @@ async function publishMarkdown(
   parentId?: string,
   skipPreview = false
 ): Promise<{ isPreview: boolean; previewText?: string; diagramCount?: number; pageId?: string; version?: number; url?: string }> {
-  // Parse markdown → ADF
-  const adf = parseMarkdownToADF(
-    markdown,
-    CONFLUENCE_BASE_URL
-  ) as unknown as any;
+  // Parse markdown → ADF. Cast once here; downstream library calls accept any.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const adf = parseMarkdownToADF(markdown, CONFLUENCE_BASE_URL) as any;
 
   const diagramCount = countDiagramBlocks(adf);
 
   if (!skipPreview) {
-    const previewText = renderADFDoc(adf as unknown as any);
+    const previewText = renderADFDoc(adf);
     return { isPreview: true, previewText, diagramCount };
   }
 
   // ----- Full publish -----
 
-  let currentVersion = 1;
-  let resolvedPageId = pageId;
+  const { resolvedPageId, currentVersion } = await getOrCreatePage(pageId, spaceKey, title, parentId);
 
-  if (resolvedPageId) {
-    // Fetch existing page to get current version
-    const existingPage = await confluenceClient.content.getContentById({
-      id: resolvedPageId,
-      expand: ['version'],
-    });
-    currentVersion = existingPage.version!.number!;
+  // Fetch current attachments to build the map (cached per page per session)
+  let currentAttachments: CurrentAttachments;
+  if (attachmentCache.has(resolvedPageId)) {
+    currentAttachments = attachmentCache.get(resolvedPageId)!;
   } else {
-    // Create a placeholder page to obtain a pageId
-    const blankAdf = {
-      version: 1,
-      type: 'doc',
-      content: [],
-    };
-
-    const createParams: Parameters<typeof confluenceClient.content.createContent>[0] = {
-      space: { key: spaceKey },
-      title,
-      type: 'page',
-      body: {
-        atlas_doc_format: {
-          value: JSON.stringify(blankAdf),
-          representation: 'atlas_doc_format',
-        },
-      },
-    };
-
-    if (parentId) {
-      createParams.ancestors = [{ id: parentId }];
+    const attachmentsResult = await confluenceClient.contentAttachments.getAttachments({
+      id: resolvedPageId,
+    });
+    currentAttachments = {};
+    for (const att of attachmentsResult.results ?? []) {
+      const attTitle = att.title ?? '';
+      const fileId = (att.extensions as any)?.fileId ?? '';
+      const collectionName = (att.extensions as any)?.collectionName ?? '';
+      if (attTitle) {
+        currentAttachments[attTitle] = {
+          filehash: (att.metadata as any)?.comment ?? '',
+          attachmentId: fileId,
+          collectionName,
+        };
+      }
     }
-
-    const created = await confluenceClient.content.createContent(createParams);
-    resolvedPageId = created.id!;
-    currentVersion = created.version!.number!;
-  }
-
-  // Fetch current attachments to build the map
-  const attachmentsResult = await confluenceClient.contentAttachments.getAttachments({
-    id: resolvedPageId,
-  });
-
-  type CurrentAttachments = Record<
-    string,
-    { filehash: string; attachmentId: string; collectionName: string }
-  >;
-
-  const currentAttachments: CurrentAttachments = {};
-  for (const att of attachmentsResult.results ?? []) {
-    const attTitle = att.title ?? '';
-    const fileId = (att.extensions as any)?.fileId ?? '';
-    const collectionName = (att.extensions as any)?.collectionName ?? '';
-    if (attTitle) {
-      currentAttachments[attTitle] = {
-        filehash: (att.metadata as any)?.comment ?? '',
-        attachmentId: fileId,
-        collectionName,
-      };
-    }
+    attachmentCache.set(resolvedPageId, currentAttachments);
   }
 
   // Build publisher functions
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const publisherFunctions = createPublisherFunctions(
-    confluenceClient as unknown as any,
+    confluenceClient as any,
     stubAdaptor,
     resolvedPageId,
     title,
@@ -430,7 +495,7 @@ async function publishMarkdown(
         (c) => new KrokiDiagramPlugin(c.type, krokiClient, c.format)
       ),
     ],
-    adf as unknown as any,
+    adf,
     publisherFunctions
   );
 
@@ -441,9 +506,9 @@ async function publishMarkdown(
     type: 'page',
     version: { number: currentVersion + 1 },
     body: {
-      atlas_doc_format: {
+      [ADF_CONTENT_TYPE]: {
         value: JSON.stringify(finalAdf),
-        representation: 'atlas_doc_format',
+        representation: ADF_CONTENT_TYPE,
       },
     },
   };
@@ -463,6 +528,65 @@ async function publishMarkdown(
     diagramCount,
     url,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Directory publish helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the preview text for a directory publish operation — the tree
+ * visualization shown to the user before they confirm with skip_preview: true.
+ * Extracted from the tool handler to keep it focused on orchestration.
+ */
+function buildDirectoryPreview(
+  nodes: DirectoryNode[],
+  skipped: Array<{ filePath: string; reason: string }>,
+  directoryPath: string,
+  rootPageId: string | undefined,
+  spaceKey: string,
+): string {
+  const rootTitle = rootPageId
+    ? `(existing page: ${rootPageId})`
+    : `"${basename(directoryPath)}" (will be created)`;
+
+  const lines: string[] = [
+    `=== DIRECTORY TREE PREVIEW ===`,
+    `Directory: ${directoryPath}`,
+    `Space: ${spaceKey}`,
+    `Root page: ${rootTitle}`,
+    `Total pages: ${nodes.length + (rootPageId ? 0 : 1)}`,
+    '',
+    '--- Page tree ---',
+  ];
+
+  const maxDepth = nodes.reduce((max, n) => Math.max(max, n.depth), 0);
+  for (let d = 0; d <= maxDepth; d++) {
+    for (const node of nodes.filter((n) => n.depth === d)) {
+      const indent = '  '.repeat(d + 1);
+      const suffix = node.isDirectory ? '/' : '';
+      const pageInfo = node.markdownFile?.pageId
+        ? `update: ${node.markdownFile.pageId}`
+        : 'new page';
+      let diagrams = '';
+      if (node.markdownFile) {
+        const count = countDiagramsInMarkdown(node.markdownFile.content);
+        if (count > 0) diagrams = `, ${count} diagram(s)`;
+      }
+      const label = node.isDirectory && !node.markdownFile ? 'placeholder' : pageInfo;
+      lines.push(`${indent}${node.title}${suffix} (${label}${diagrams})`);
+    }
+  }
+
+  if (skipped.length > 0) {
+    lines.push('', '--- Skipped files ---');
+    for (const s of skipped) {
+      lines.push(`  ${basename(s.filePath)}: ${s.reason}`);
+    }
+  }
+
+  lines.push('', `Call again with skip_preview: true to publish.`);
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -582,13 +706,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         .object({ markdown: z.string(), title: z.string() })
         .parse(args);
 
-      const adf = parseMarkdownToADF(
-        input.markdown,
-        CONFLUENCE_BASE_URL
-      ) as unknown as any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const adf = parseMarkdownToADF(input.markdown, CONFLUENCE_BASE_URL) as any;
 
       const diagramCount = countDiagramBlocks(adf);
-      const previewText = renderADFDoc(adf as unknown as any);
+      const previewText = renderADFDoc(adf);
 
       const lines: string[] = [previewText];
       if (diagramCount > 0) {
@@ -659,7 +781,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         })
         .parse(args);
 
-      const raw = await readFile(input.filePath, 'utf-8');
+      const safeFilePath = await validatePath(input.filePath);
+      const raw = await readFile(safeFilePath, 'utf-8');
       const parsed = matter(raw);
 
       const title: string =
@@ -743,13 +866,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           spaceKey: z.string(),
           rootPageId: z.string().optional(),
           skip_preview: z.boolean().default(false),
-          concurrency: z.number().int().min(1).max(20).default(5),
+          concurrency: z.number().int().min(1).max(MAX_PUBLISH_CONCURRENCY).default(DEFAULT_PUBLISH_CONCURRENCY),
         })
         .parse(args);
 
+      const safeDirectoryPath = await validatePath(input.directoryPath);
+
       // Scan directory tree
       const { nodes, skipped } = await scanDirectoryTree(
-        input.directoryPath,
+        safeDirectoryPath,
         input.spaceKey
       );
 
@@ -761,49 +886,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // Preview mode
       if (!input.skip_preview) {
-        const rootTitle = input.rootPageId
-          ? `(existing page: ${input.rootPageId})`
-          : `"${basename(input.directoryPath)}" (will be created)`;
-
-        const lines: string[] = [
-          `=== DIRECTORY TREE PREVIEW ===`,
-          `Directory: ${input.directoryPath}`,
-          `Space: ${input.spaceKey}`,
-          `Root page: ${rootTitle}`,
-          `Total pages: ${nodes.length + (input.rootPageId ? 0 : 1)}`,
-          '',
-          '--- Page tree ---',
-        ];
-
-        // Build tree visualization
-        const maxDepth = nodes.reduce((max, n) => Math.max(max, n.depth), 0);
-        for (let d = 0; d <= maxDepth; d++) {
-          for (const node of nodes.filter((n) => n.depth === d)) {
-            const indent = '  '.repeat(d + 1);
-            const suffix = node.isDirectory ? '/' : '';
-            const pageInfo = node.markdownFile?.pageId
-              ? `update: ${node.markdownFile.pageId}`
-              : 'new page';
-            let diagrams = '';
-            if (node.markdownFile) {
-              const adf = parseMarkdownToADF(node.markdownFile.content, CONFLUENCE_BASE_URL) as any;
-              const count = countDiagramBlocks(adf);
-              if (count > 0) diagrams = `, ${count} diagram(s)`;
-            }
-            const label = node.isDirectory && !node.markdownFile ? 'placeholder' : pageInfo;
-            lines.push(`${indent}${node.title}${suffix} (${label}${diagrams})`);
-          }
-        }
-
-        if (skipped.length > 0) {
-          lines.push('', '--- Skipped files ---');
-          for (const s of skipped) {
-            lines.push(`  ${basename(s.filePath)}: ${s.reason}`);
-          }
-        }
-
-        lines.push('', `Call again with skip_preview: true to publish.`);
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
+        const preview = buildDirectoryPreview(
+          nodes, skipped, input.directoryPath, input.rootPageId, input.spaceKey
+        );
+        return { content: [{ type: 'text', text: preview }] };
       }
 
       // Publish mode — process level by level
@@ -848,16 +934,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         } catch (err: unknown) {
           return {
             isError: true,
-            content: [{
-              type: 'text',
-              text: `Error creating root page: ${err instanceof Error ? err.message : String(err)}`,
-            }],
+            content: [{ type: 'text', text: `Error creating root page: ${errorMessage(err)}` }],
           };
         }
       }
 
-      // Build a map from relativePath to node for parent lookups
+      // Build a map from relativePath → node for parent lookups, and a separate
+      // map for resolved page IDs so we never mutate the input node objects.
       const nodeMap = new Map<string, DirectoryNode>();
+      const resolvedIds = new Map<string, string>(); // relativePath → pageId
       for (const node of nodes) {
         nodeMap.set(node.relativePath, node);
       }
@@ -877,7 +962,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 parentId = rootPageId;
               } else {
                 const parentNode = nodeMap.get(node.parentRelativePath);
-                parentId = parentNode?.resolvedPageId;
+                parentId = parentNode ? resolvedIds.get(parentNode.relativePath) : undefined;
               }
 
               if (!parentId) {
@@ -903,8 +988,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   true
                 );
 
-                // Store resolved page ID for children
-                node.resolvedPageId = result.pageId;
+                if (result.pageId) {
+                  resolvedIds.set(node.relativePath, result.pageId);
+                }
 
                 return {
                   relativePath: node.relativePath,
@@ -922,7 +1008,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   title: node.title,
                   success: false,
                   isDirectory: node.isDirectory,
-                  error: err instanceof Error ? err.message : String(err),
+                  error: errorMessage(err),
                 };
               }
             })
@@ -941,9 +1027,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // Find nodes with wiki links that need re-publishing
+      // Find nodes with wiki links that were successfully published and need re-publishing
       const nodesWithLinks = nodes.filter(
-        (n) => n.markdownFile && hasWikiLinks(n.markdownFile.content) && n.resolvedPageId
+        (n) => n.markdownFile && hasWikiLinks(n.markdownFile.content) && resolvedIds.has(n.relativePath)
       );
 
       if (nodesWithLinks.length > 0 && titleToUrl.size > 0) {
@@ -959,13 +1045,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   resolvedMarkdown,
                   node.title,
                   input.spaceKey,
-                  node.resolvedPageId,
+                  resolvedIds.get(node.relativePath),
                   undefined, // don't reparent on second pass
                   true
                 );
                 return { relativePath: node.relativePath, title: node.title, success: true, version: result.version };
-              } catch {
-                return { relativePath: node.relativePath, title: node.title, success: false };
+              } catch (err: unknown) {
+                return { relativePath: node.relativePath, title: node.title, success: false, error: errorMessage(err) };
               }
             })
           )
@@ -1028,10 +1114,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{ type: 'text', text: `Error: Unknown tool "${name}"` }],
     };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
     return {
       isError: true,
-      content: [{ type: 'text', text: `Error: ${message}` }],
+      content: [{ type: 'text', text: `Error: ${errorMessage(err)}` }],
     };
   }
 });

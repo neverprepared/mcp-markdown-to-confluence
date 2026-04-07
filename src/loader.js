@@ -22,7 +22,10 @@ function tryResolveFile(filePath) {
           return pathToFileURL(resolved).href;
         }
       }
-    } catch {}
+    } catch (err) {
+      // Non-fatal: if package.json is unparseable we simply can't resolve this path.
+      process.stderr.write(`[loader] Failed to parse package.json at ${filePath}: ${err?.message ?? err}\n`);
+    }
   }
   return null;
 }

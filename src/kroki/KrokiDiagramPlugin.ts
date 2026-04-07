@@ -46,7 +46,7 @@ export class KrokiDiagramPlugin
       nodes.map((node) => {
         const details = getDiagramFileName(
           this.diagramType,
-          node?.content?.at(0)?.text,
+          node?.content?.[0]?.text,
           this.outputFormat
         );
         return {
@@ -63,12 +63,12 @@ export class KrokiDiagramPlugin
     charts: ChartData[],
     supportFunctions: PublisherFunctions
   ): Promise<Record<string, UploadedImage | null>> {
-    let imageMap: Record<string, UploadedImage | null> = {};
-
     if (charts.length === 0) {
-      return imageMap;
+      return {};
     }
 
+    // Render all diagrams in parallel, then upload all results in parallel.
+    // Previously uploads were sequential (N+1); now both phases are concurrent.
     const rendered = await Promise.all(
       charts.map(async (chart) => {
         const buffer = await this.client.renderDiagram(
@@ -80,11 +80,17 @@ export class KrokiDiagramPlugin
       })
     );
 
-    for (const [name, buffer] of rendered) {
-      const uploaded = await supportFunctions.uploadBuffer(name, buffer);
-      imageMap = { ...imageMap, [name]: uploaded };
-    }
+    const uploaded = await Promise.all(
+      rendered.map(async ([name, buffer]) => {
+        const image = await supportFunctions.uploadBuffer(name, buffer);
+        return [name, image] as const;
+      })
+    );
 
+    const imageMap: Record<string, UploadedImage | null> = {};
+    for (const [name, image] of uploaded) {
+      imageMap[name] = image;
+    }
     return imageMap;
   }
 
@@ -98,7 +104,7 @@ export class KrokiDiagramPlugin
       traverse(afterAdf, {
         codeBlock: (node, _parent) => {
           if (node?.attrs?.['language'] === this.diagramType) {
-            const content = node?.content?.at(0)?.text;
+            const content = node?.content?.[0]?.text;
             if (!content) {
               return;
             }
