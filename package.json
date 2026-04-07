@@ -22,7 +22,7 @@
   "dependencies": {
     "@markdown-confluence/lib": "5.5.2",
     "@modelcontextprotocol/sdk": "^1.10.1",
-    "confluence.js": "^1.6.3",
+    "confluence.js": "^2.1.0",
     "gray-matter": "^4.0.3",
     "zod": "^3.24.3"
   },
