@@ -1,15 +1,27 @@
+name: kroki
+
 services:
   kroki:
     image: yuzutech/kroki
-    ports:
-      - "8371:8000"
+    container_name: kroki
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8371:8000"
     environment:
       - KROKI_MERMAID_HOST=mermaid
     depends_on:
       - mermaid
+    labels:
+      com.neverprepared.service: "true"
+      com.neverprepared.service.name: "kroki"
+      com.neverprepared.service.url: "http://localhost:8371"
+      com.neverprepared.service.description: "Diagram rendering (Mermaid, PlantUML, D2, Graphviz)"
+
   mermaid:
     image: yuzutech/kroki-mermaid
     restart: unless-stopped
     expose:
       - "8002"
+    labels:
+      com.neverprepared.service: "true"
+      com.neverprepared.service.name: "kroki-mermaid"
